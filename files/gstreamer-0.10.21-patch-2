@@ -1,0 +1,491 @@
+Index: plugins/elements/gstfilesrc.c
+===================================================================
+--- plugins/elements/gstfilesrc.c	(.../trunk)	(revision 139320)
++++ plugins/elements/gstfilesrc.c	(.../submissions/20.1)	(revision 159714)
+@@ -809,7 +809,7 @@
+ gst_file_src_create_read (GstFileSrc * src, guint64 offset, guint length,
+     GstBuffer ** buffer)
+ {
+-  int ret;
++  int i,ret;
+   GstBuffer *buf;
+ 
+   if (G_UNLIKELY (src->read_position != offset)) {
+@@ -825,7 +825,18 @@
+   buf = gst_buffer_new_and_alloc (length);
+ 
+   GST_LOG_OBJECT (src, "Reading %d bytes", length);
++  for (i = 0; i < 4; ++i) {
++    /* pos won't change if an error is returned,
++      so we don't need to seek before every retry */
+   ret = read (src->fd, GST_BUFFER_DATA (buf), length);
++    if (G_LIKELY(ret >= 0 && ret <= length)) {
++      break;
++    }
++    usleep(1000); /* failed, but don't retry immediately (yield for 1ms) */
++  }
++  if (i > 0) {
++    GST_WARNING_OBJECT(src, "%d soft read errors", i);
++  }
+   if (G_UNLIKELY (ret < 0))
+     goto could_not_read;
+ 
+Index: gst/gstinfo.c
+===================================================================
+--- gst/gstinfo.c	(.../trunk)	(revision 139320)
++++ gst/gstinfo.c	(.../submissions/20.1)	(revision 159714)
+@@ -462,7 +462,8 @@
+ gst_debug_message_get (GstDebugMessage * message)
+ {
+   if (message->message == NULL) {
+-    message->message = g_strdup_vprintf (message->format, message->arguments);
++   // message->message = g_strdup_vprintf (message->format, message->arguments);
++   vasprintf (&message->message, message->format, message->arguments);
+   }
+   return message->message;
+ }
+Index: gst/gst.c
+===================================================================
+--- gst/gst.c	(.../trunk)	(revision 139320)
++++ gst/gst.c	(.../submissions/20.1)	(revision 159714)
+@@ -602,6 +602,12 @@
+   }
+ 
+   priv_gst_dump_dot_dir = g_getenv ("GST_DEBUG_DUMP_DOT_DIR");
++
++  if (priv_gst_dump_dot_dir == NULL)
++  {
++	priv_gst_dump_dot_dir = "/var/log";
++  }
++
+ #endif
+   /* This is the earliest we can make stuff show up in the logs.
+    * So give some useful info about GStreamer here */
+@@ -958,6 +964,9 @@
+  * - we don't have cases yet where this fails, but in the future
+  *   we might and then it's nice to be able to return that
+  */
++
++#include "GstReadBinRegistry.c"
++
+ static gboolean
+ init_post (GOptionContext * context, GOptionGroup * group, gpointer data,
+     GError ** error)
+@@ -1084,6 +1093,7 @@
+   if (!ensure_current_registry (error))
+     return FALSE;
+ #endif /* GST_DISABLE_REGISTRY */
++  GstBinRegistryReadRegistry();
+ 
+   /* if we need to preload plugins, do so now */
+   g_slist_foreach (preload_plugins, load_plugin_func, NULL);
+Index: gst/GstReadBinRegistry.c
+===================================================================
+--- gst/GstReadBinRegistry.c	(.../trunk)	(revision 0)
++++ gst/GstReadBinRegistry.c	(.../submissions/20.1)	(revision 159714)
+@@ -0,0 +1,339 @@
++/* ============================================================
++  * Author: Renchi Raju
++  * Date  : 2007-02-18
++  * Copyright 2007 Palm, Inc. All rights reserved.
++  *
++  * This library is free software; you can redistribute it and/or
++  * modify it under the terms of the GNU Library General Public
++  * License as published by the Free Software Foundation; either
++  * version 2 of the License, or (at your option) any later version.
++  *
++  * This library is distributed in the hope that it will be useful,
++  * but WITHOUT ANY WARRANTY; without even the implied warranty of
++  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++  * Library General Public License for more details.
++  * You should have received a copy of the GNU Library General Public
++  * License along with this library; if not, write to the
++  * Free Software Foundation, Inc., 59 Temple Place - Suite 330,
++  * Boston, MA 02111-1307, USA.
++  * ============================================================ */
++
++
++#include <string.h>
++#include <gst/gst.h>
++
++#define GST_BIN_REG_PLUGIN_PATH  "/usr/lib/gstreamer-0.10"
++#define GST_BIN_REG_REGISTRY_DIR "/var/lib/media/gstreamer-0.10"
++
++static int
++GstBinRegistryReadString(char** str, FILE* f)
++{
++    int strLen;
++
++    if (fread(&strLen, sizeof(int), 1, f) != 1)
++    {
++        return -1;
++    }
++
++    *str = (char*) malloc(strLen + 1);
++    (*str)[strLen] = 0;
++
++    if (strLen > 0)
++    {
++        if (fread(*str, strLen, 1, f) != 1)
++        {
++            return -1;
++        }
++    }
++
++    return 0;
++}
++
++static int
++GstBinRegistryReadInt(int* val, FILE* f)
++{
++
++    if (fread(val, sizeof(int), 1, f) != 1)
++    {
++        return -1;
++    }
++
++    return 0;
++}
++
++#define READ_STR(x)                                       \
++do {                                                      \
++if (GstBinRegistryReadString((char**)&(x), regFile) != 0) \
++{                                                         \
++    if (feof(regFile) == 0)                               \
++    {                                                     \
++        gst_object_unref(plugin);                         \
++        ret = FALSE;                                      \
++    }                                                     \
++    goto finished;                                        \
++}                                                         \
++} while (0)
++
++#define READ_INT(x)                                       \
++do {                                                      \
++if (GstBinRegistryReadInt((int*)&(x), regFile) != 0)      \
++{                                                         \
++    if (feof(regFile) == 0)                               \
++    {                                                     \
++        gst_object_unref(plugin);                         \
++        ret = FALSE;                                      \
++    }                                                     \
++    goto finished;                                        \
++}                                                         \
++} while (0)
++
++static gboolean
++GstBinRegistryReadRegistry()
++{
++    char           *regFilePath;
++    FILE           *regFile;
++    GstPlugin      *plugin;
++    gboolean        ret = TRUE;
++
++    // Open the registry file
++    regFilePath = g_strjoin("/", GST_BIN_REG_REGISTRY_DIR, "registry.bin", NULL);
++    regFile = fopen(regFilePath, "rb");
++    if (!regFile)
++    {
++        fprintf(stderr, "FATAL ERROR: Failed to read gstreamer binary registry. "
++                "Plugins will not be registered\n");
++        ret = FALSE;
++        goto finished;
++    }
++
++    while (1)
++    {
++        int numFeatures;
++        int feat;
++
++        plugin = (GstPlugin*) g_object_new(GST_TYPE_PLUGIN, NULL);
++        plugin->flags |= GST_PLUGIN_FLAG_CACHED;
++
++        // name
++        READ_STR(plugin->desc.name);
++
++        // description
++        READ_STR(plugin->desc.description);
++
++        // filename
++        READ_STR(plugin->filename);
++
++        // filesize
++        READ_INT(plugin->file_size);
++
++        // file mtime
++        READ_INT(plugin->file_mtime);
++
++        // version
++        READ_STR(plugin->desc.version);
++
++        // license
++        READ_STR(plugin->desc.license);
++
++        // source
++        READ_STR(plugin->desc.source);
++
++        // package
++        READ_STR(plugin->desc.package);
++
++        // origin
++        READ_STR(plugin->desc.origin);
++
++
++        // Add plugin to registry
++        gst_registry_add_plugin(gst_registry_get_default(), plugin);
++
++        // Num of Features
++        READ_INT(numFeatures);
++
++        for (feat = 0; feat < numFeatures; feat++)
++        {
++            GstPluginFeature *feature = 0;
++            char             *typeName = 0;
++            GType             type = 0;
++
++            // typename
++            READ_STR(typeName);
++
++            // create feature object from typename
++            type = g_type_from_name(typeName);
++            free(typeName);
++
++            if (!type)
++            {
++                fprintf(stderr, "Unknown type\n");
++                goto finished;
++            }
++
++            feature = (GstPluginFeature*) g_object_new(type, NULL);
++            if (!feature)
++            {
++                fprintf(stderr, "Failed to create feature object\n");
++                goto finished;
++            }
++            if (!GST_IS_PLUGIN_FEATURE(feature))
++            {
++                fprintf(stderr, "Could not identify feature object\n");
++                if (GST_IS_OBJECT(feature))
++                {
++                    gst_object_unref(feature);
++                }
++                else
++                {
++                    g_object_unref(feature);
++                }
++                goto finished;
++            }
++
++            feature->plugin_name = g_strdup(plugin->desc.name);
++
++            // name
++            READ_STR(feature->name);
++
++            // rank
++            READ_INT(feature->rank);
++
++            if (GST_IS_ELEMENT_FACTORY(feature))
++            {
++                GstElementFactory *factory = GST_ELEMENT_FACTORY(feature);
++                int                numPadTemplates = 0, numInterfaces = 0;
++                int                pad, interface;
++                int                hasUri = 0;
++
++                // longname
++                READ_STR(factory->details.longname);
++                // class
++                READ_STR(factory->details.klass);
++
++                // description
++                READ_STR(factory->details.description);
++
++                // author
++                READ_STR(factory->details.author);
++
++                // Number of PadTemplates
++                READ_INT(numPadTemplates);
++
++                for (pad = 0; pad < numPadTemplates; pad++)
++                {
++                    GstStaticPadTemplate* templ = (GstStaticPadTemplate*) malloc(sizeof(GstStaticPadTemplate));
++                    memset(templ, 0, sizeof(GstStaticPadTemplate));
++
++                    // nametemplate
++                    READ_STR(templ->name_template);
++
++                    // direction
++                    READ_INT(templ->direction);
++
++                    // presence
++                    READ_INT(templ->presence);
++
++                    // static caps string
++                    READ_STR(templ->static_caps.string);
++
++                    __gst_element_factory_add_static_pad_template(factory, templ);
++                }
++
++                // Number of interfaces
++                READ_INT(numInterfaces);
++
++                for (interface = 0; interface < numInterfaces; interface++)
++                {
++                    char* str = 0;
++
++                    // interface
++                    READ_STR(str);
++
++                    __gst_element_factory_add_interface(factory, str);
++                    free(str);
++                }
++
++                // has URI
++                READ_INT(hasUri);
++
++                if (hasUri)
++                {
++                    int  numUriProtocols = 0;
++                    int  protocol;
++
++                    // uri type
++                    READ_INT(factory->uri_type);
++
++                    // number of uri protocols
++                    READ_INT(numUriProtocols);
++
++                    if (numUriProtocols > 0)
++                    {
++                        factory->uri_protocols = (char**) malloc(sizeof(char*) * (numUriProtocols + 1));
++                        factory->uri_protocols[numUriProtocols] = 0;
++
++                        for (protocol = 0; protocol < numUriProtocols; protocol++)
++                        {
++                            // uri protocol
++                            READ_STR(factory->uri_protocols[protocol]);
++                        }
++                    }
++                }
++            }
++            else if (GST_IS_TYPE_FIND_FACTORY(feature))
++            {
++                GstTypeFindFactory *factory = GST_TYPE_FIND_FACTORY(feature);
++                char               *capsStr = 0;
++                int                 numExtensions = 0;
++                int                 extension;
++
++                // Caps String
++                READ_STR(capsStr);
++
++                if (capsStr)
++                {
++                    factory->caps = gst_caps_from_string(capsStr);
++                    free(capsStr);
++                }
++
++                // Number of Extensions
++                READ_INT(numExtensions);
++
++                if (numExtensions > 0)
++                {
++                    factory->extensions = (char**) malloc(sizeof(char*) * (numExtensions + 1));
++                    factory->extensions[numExtensions] = 0;
++
++                    for (extension = 0; extension < numExtensions; extension++)
++                    {
++                        READ_STR(factory->extensions[extension]);
++                    }
++                }
++            }
++            else if (GST_IS_INDEX_FACTORY(feature))
++            {
++                GstIndexFactory *factory = GST_INDEX_FACTORY(feature);
++
++                // long description
++                READ_STR(factory->longdesc);
++            }
++
++            // Add feature to registry
++            gst_registry_add_feature(gst_registry_get_default(),
++                                     feature);
++        }
++    }
++
++ finished:
++
++    free(regFilePath);
++
++    if (regFile)
++    {
++        fclose(regFile);
++    }
++
++    return ret;
++}
++
++
+Index: gst/gstbuffer.c
+===================================================================
+--- gst/gstbuffer.c	(.../trunk)	(revision 139320)
++++ gst/gstbuffer.c	(.../submissions/20.1)	(revision 159714)
+@@ -131,6 +131,11 @@
+ 
+ static GstMiniObjectClass *parent_class = NULL;
+ 
++GST_DEBUG_CATEGORY_STATIC(gstbufferleak);
++
++static int init_count=0;
++static int finalize_count=0;
++
+ void
+ _gst_buffer_initialize (void)
+ {
+@@ -139,6 +144,8 @@
+    * see http://bugzilla.gnome.org/show_bug.cgi?id=304551 */
+   g_type_class_ref (gst_buffer_get_type ());
+   g_type_class_ref (gst_subbuffer_get_type ());
++
++  GST_DEBUG_CATEGORY_INIT(gstbufferleak, "gstbufferleak", 0, "GST Buffer Memory Leak Logs");
+ }
+ 
+ GType
+@@ -185,6 +192,9 @@
+ 
+   GST_CAT_LOG (GST_CAT_BUFFER, "finalize %p", buffer);
+ 
++  finalize_count++;
++  GST_CAT_LOG(gstbufferleak, "%6d %6d outstanding: %6d", init_count, finalize_count, init_count-finalize_count);  
++
+   /* free our data */
+   g_free (buffer->malloc_data);
+ 
+@@ -273,6 +283,11 @@
+ 
+   buffer = (GstBuffer *) instance;
+ 
++  init_count++;
++  #if 0
++    GST_CAT_LOG(gstbufferleak, "%6d %6d outstanding: %6d", init_count, finalize_count, init_count-finalize_count);
++  #endif
++
+   GST_CAT_LOG (GST_CAT_BUFFER, "init %p", buffer);
+ 
+   GST_BUFFER_TIMESTAMP (buffer) = GST_CLOCK_TIME_NONE;
+Index: Makefile.am
+===================================================================
+--- Makefile.am	(.../trunk)	(revision 139320)
++++ Makefile.am	(.../submissions/20.1)	(revision 159714)
+@@ -12,14 +12,12 @@
+ 
+ SUBDIRS = \
+ 	gst libs plugins tools tests \
+-	docs \
+ 	pkgconfig po \
+ 	common
+ 
+ # These are all the possible subdirs
+ DIST_SUBDIRS = \
+ 	gst libs plugins tools tests \
+-	docs \
+ 	pkgconfig po \
+ 	common
+ 

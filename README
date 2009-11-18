@@ -1,0 +1,12 @@
+This repo includes the necessary files to build working Gstreamer framework compatible with the webos-internals Video Recorder application.
+
+Gstreamer-0.10.21 is located at http://gstreamer.freedesktop.org/
+
+The patch gstreamer-0.10.21-patch-2, and information about it's release, is located at http://opensource.palm.com 
+
+The patch gstreamer-0.10.21-EOS-on-INT.patch is a backport of functionality implemented in current versions of gstreamer, and thus can also be found at:
+	http://gstreamer.freedesktop.org/
+
+All code is licensed under LGPL unless otherwise noted.
+
+As of this README date, the only binary necessary to be built for compatible functionality is gst-launch.
